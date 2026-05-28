@@ -1,15 +1,34 @@
-import { fetch } from 'wix-fetch';
+import { response, serverError } from 'wix-http-functions';
 import { products, collections } from 'wix-stores.v2';
 import { ELEADS_CONFIG } from 'backend/eleads-config';
 
-const API_BASE_URL = ELEADS_CONFIG.api_base_url;
-const API_TOKEN = ELEADS_CONFIG.api_token;
 const SITE_URL = ELEADS_CONFIG.site_url;
+const SHOP_NAME = ELEADS_CONFIG.shop_name;
+const SHOP_EMAIL = ELEADS_CONFIG.shop_email;
 const LANGUAGE = ELEADS_CONFIG.language;
 const DEFAULT_CURRENCY = ELEADS_CONFIG.currency;
 const DEFAULT_CATEGORY = ELEADS_CONFIG.default_category;
 const WIX_DEFAULT_CATEGORY_IDS = ELEADS_CONFIG.wix_default_category_ids;
 const WIX_DEFAULT_CATEGORY_NAMES = ELEADS_CONFIG.wix_default_category_names;
+
+function escapeXml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function cleanParamValue(value = '') {
+  return String(value)
+    .replace(/<[^>]*>/g, '')        // убрать HTML
+    .replace(/&quot;|&#34;/g, '')   // убрать "
+    .replace(/&amp;/g, '&')        // вернуть &
+    .replace(/[\"']/g, '')         // убрать кавычки
+    .replace(/\s+/g, ' ')          // лишние пробелы
+    .trim();
+}
 
 function stripHtml(html = '') {
   return String(html).replace(/<[^>]*>/g, '').trim();
@@ -22,30 +41,11 @@ function isDefaultWixCategory(id, name = '') {
   );
 }
 
-function getPrice(product) {
-  const value =
-    product.priceData?.price ??
-    product.priceData?.discountedPrice ??
-    product.price?.price ??
-    product.price?.discountedPrice ??
-    product.price?.amount ??
-    product.price ??
-    product.discountedPrice;
-
-  if (typeof value === 'object' || value === undefined || value === null) {
-    return 0;
-  }
-
-  return Number(value) || 0;
-}
-
 function getProductUrl(product) {
   if (typeof product.productPageUrl === 'string') {
-    if (product.productPageUrl.startsWith('http')) {
-      return product.productPageUrl;
-    }
-
-    return `${SITE_URL}${product.productPageUrl}`;
+    return product.productPageUrl.startsWith('http')
+      ? product.productPageUrl
+      : `${SITE_URL}${product.productPageUrl}`;
   }
 
   if (product.productPageUrl?.base && product.productPageUrl?.path) {
@@ -57,248 +57,197 @@ function getProductUrl(product) {
     return `${base}${path}`;
   }
 
-  return '';
+  return `${SITE_URL}/product-page/${product.slug || product._id}`;
 }
 
 function getImage(product) {
   return product.media?.mainMedia?.image?.url || '';
 }
 
-function getCategoryId(product) {
-  const collection_ids = product.collectionIds || product.collections || [];
+function getPrice(product) {
+  const value =
+    product.priceData?.price ??
+    product.priceData?.discountedPrice ??
+    product.price?.price ??
+    product.price?.discountedPrice ??
+    product.price?.amount ??
+    product.price;
 
-  if (Array.isArray(collection_ids) && collection_ids.length) {
-    const first = collection_ids[0];
+  if (typeof value === 'object' || value == null) return 0;
 
-    if (typeof first === 'string') {
-      return first;
-    }
+  return value;
+}
 
-    return first._id || first.id || null;
+async function getAllProducts() {
+  let all = [];
+
+  let result = await products.queryProducts().limit(100).find();
+  all.push(...(result.items || []));
+
+  while (result.hasNext()) {
+    result = await result.next();
+    all.push(...(result.items || []));
   }
 
-  return null;
+  return all;
 }
 
-function getEventProductId(event) {
-  return event.productId || event._id || event.id || event.product?._id || event.product?.id;
-}
+async function getAllCollections() {
+  try {
+    let all = [];
 
-function buildCategoryPayload(category_id, category = null) {
-  if (!category_id || isDefaultWixCategory(category_id, category?.name || '')) {
-    return {
-      external_id: DEFAULT_CATEGORY.id,
-      external_name: DEFAULT_CATEGORY.name,
-      external_url: DEFAULT_CATEGORY.url,
-      external_parent_id: '',
-      external_parent_name: '',
-      external_parent_url: '',
-      full_path: DEFAULT_CATEGORY.full_path,
-      position: DEFAULT_CATEGORY.position,
-      parent_position: 0,
-      path: DEFAULT_CATEGORY.path
-    };
-  }
+    let result = await collections.queryCollections().limit(100).find();
+    all.push(...(result.items || []));
 
-  return {
-    external_id: String(category_id),
-    external_name: category?.name || DEFAULT_CATEGORY.name,
-    external_url: category?.collectionPageUrl || '',
-    external_parent_id: '',
-    external_parent_name: '',
-    external_parent_url: '',
-    full_path: category?.name || DEFAULT_CATEGORY.full_path,
-    position: 0,
-    parent_position: 0,
-    path: category?.name ? [category.name] : DEFAULT_CATEGORY.path
-  };
-}
-
-function buildPayload(product, category = null) {
-  const external_id = String(product._id || product.id);
-  const url = getProductUrl(product);
-  const image = getImage(product);
-  const in_stock = product.stock?.inStock ?? product.inStock ?? false;
-  const quantity = product.stock?.quantity ?? (in_stock ? 1000 : 0);
-  const description = stripHtml(product.description || '');
-  const category_id = getCategoryId(product);
-
-  return {
-    language: LANGUAGE,
-    external_id,
-    payload: {
-      source: {
-        offer_id: external_id,
-        language: LANGUAGE,
-        url,
-        group_id: '1'
-      },
-      product: {
-        title: product.name || '',
-        description,
-        short_description: product.name || '',
-        price: getPrice(product),
-        old_price: 0,
-        currency: product.priceData?.currency || product.currency || DEFAULT_CURRENCY,
-        quantity,
-        stock_status: in_stock ? 'В наявності' : 'Немає в наявності',
-        vendor: product.brand || '',
-        sku: product.sku || '',
-        label: '',
-        sort_order: 0,
-        attributes: {
-          sku: product.sku || '',
-          brand: product.brand || ''
-        },
-        attribute_filters: [],
-        images: image ? [image] : []
-      },
-      category: buildCategoryPayload(category_id, category)
+    while (result.hasNext()) {
+      result = await result.next();
+      all.push(...(result.items || []));
     }
-  };
+
+    return all;
+  } catch (e) {
+    return [];
+  }
 }
 
-async function sendToELeads(method, url, body) {
-  console.log('E_LEADS_REQUEST:', method, url, JSON.stringify(body));
+function filterCollections(all_collections) {
+  return all_collections.filter((category) => {
+    const id = category._id || category.id;
+    const name = category.name || '';
 
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json'
-    },
-    body: JSON.stringify(body)
+    return !isDefaultWixCategory(id, name);
   });
-
-  const text = await res.text();
-
-  console.log('E_LEADS_RESPONSE:', res.status, text);
-
-  if (!res.ok) {
-    console.error('E_LEADS_SYNC_ERROR:', res.status, text);
-  }
-
-  return text;
 }
 
-async function getProductById(product_id) {
-  try {
-    const result = await products.getProduct(product_id);
-    return result.product || result;
-  } catch (error) {
-    console.warn('E_LEADS_PRODUCT_NOT_FOUND:', product_id, error.message);
-    return null;
-  }
+function buildCategoriesXml(all_collections) {
+  const filtered = filterCollections(all_collections);
+
+  const default_category_xml = `<category id="${escapeXml(DEFAULT_CATEGORY.id)}" position="${escapeXml(DEFAULT_CATEGORY.position)}" url="${escapeXml(DEFAULT_CATEGORY.url)}">${escapeXml(DEFAULT_CATEGORY.name)}</category>`;
+
+  const categories_xml = filtered.map((category, index) => {
+    const id = category._id || category.id || index + 1;
+    const name = category.name || DEFAULT_CATEGORY.name;
+    const url = category.collectionPageUrl || SITE_URL;
+
+    return `<category id="${escapeXml(id)}" position="${index + 2}" url="${escapeXml(url)}">${escapeXml(name)}</category>`;
+  }).join('\n');
+
+  return categories_xml
+    ? `${default_category_xml}\n${categories_xml}`
+    : default_category_xml;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+function getCategoryId(product, all_collections) {
+  const ids = product.collectionIds || product.collections || [];
 
-async function getCategoryById(category_id) {
-  if (!category_id) {
-    return null;
-  }
+  if (Array.isArray(ids) && ids.length) {
+    const first = ids[0];
 
-  try {
-    const result = await collections.getCollection(category_id);
-    return result.collection || result;
-  } catch (error) {
-    console.error('E_LEADS_CATEGORY_GET_ERROR:', category_id, error.message);
-    return null;
-  }
-}
+    const id = typeof first === 'string'
+      ? first
+      : first._id || first.id;
 
-async function getProductByIdWithRetry(product_id, attempts = 5, delay = 2000) {
-  for (let i = 1; i <= attempts; i++) {
-    const product = await getProductById(product_id);
+    const category = all_collections.find((item) => {
+      const collection_id = item._id || item.id;
+      return collection_id === id;
+    });
 
-    if (product) {
-      return product;
+    const category_name = category?.name || '';
+
+    if (!id || isDefaultWixCategory(id, category_name)) {
+      return DEFAULT_CATEGORY.id;
     }
 
-    console.warn(`E_LEADS_PRODUCT_RETRY ${i}/${attempts}:`, product_id);
-    await sleep(delay);
+    return id;
   }
 
-  return null;
+  return DEFAULT_CATEGORY.id;
 }
 
-async function syncProduct(product_id, action) {
-  console.log('E_LEADS_SYNC_START:', action, product_id);
+function buildParamsXml(product) {
+  const sections = product.additionalInfoSections || [];
 
-  if (action === 'create' || action === 'update') {
-    await sleep(3000);
-  }
+  if (!Array.isArray(sections)) return '';
 
-  const product = await getProductByIdWithRetry(product_id);
+  return sections.map(section => {
+    const name = section.title || '';
+    const value = cleanParamValue(section.description || '');
 
-  if (!product) {
-    console.warn('E_LEADS_SYNC_SKIPPED_PRODUCT_NOT_FOUND:', action, product_id);
-    return;
-  }
-
-  const category_id = getCategoryId(product);
-  const category = await getCategoryById(category_id);
-  const payload = buildPayload(product, category);
-
-  console.log('E_LEADS_PAYLOAD:', JSON.stringify(payload, null, 2));
-
-  if (action === 'create') {
-    return sendToELeads('POST', `${API_BASE_URL}/ecommerce/items`, payload);
-  }
-
-  if (action === 'update') {
-    return sendToELeads(
-      'PUT',
-      `${API_BASE_URL}/ecommerce/items/${encodeURIComponent(payload.external_id)}`,
-      payload
-    );
-  }
+    return `<param name="${escapeXml(name)}">${escapeXml(value)}</param>`;
+  }).join('\n');
 }
 
-export async function wixStores_onProductCreated(event) {
-  console.log('E_LEADS_PRODUCT_CREATED_EVENT:', JSON.stringify(event));
+function buildOffersXml(all_products, all_collections) {
+  return all_products.map((product, index) => {
+    const id = product._id || product.id;
+    const price = getPrice(product);
+    const currency = product.priceData?.currency || DEFAULT_CURRENCY;
+    const in_stock = product.stock?.inStock ?? product.inStock ?? false;
+    const quantity = product.stock?.quantity ?? (in_stock ? 1000 : 0);
+    const available = in_stock ? 'true' : 'false';
+    const stock_status = in_stock ? 'В наявності' : 'Немає в наявності';
+    const url = getProductUrl(product);
+    const image = getImage(product);
+    const category_id = getCategoryId(product, all_collections);
+    const description = stripHtml(product.description || product.name || '');
+    const params = buildParamsXml(product);
+    const vendor = product.brand || '';
 
-  const product_id = getEventProductId(event);
-
-  if (!product_id) {
-    console.error('E_LEADS_CREATE_NO_PRODUCT_ID:', JSON.stringify(event));
-    return;
-  }
-
-  return syncProduct(product_id, 'create');
+    return `<offer id="${escapeXml(id)}" available="${available}">
+  <url>${escapeXml(url)}</url>
+  <name>${escapeXml(product.name || '')}</name>
+  <price>${escapeXml(price)}</price>
+  <old_price></old_price>
+  <currency>${escapeXml(currency)}</currency>
+  <categoryId>${escapeXml(category_id || '')}</categoryId>
+  <quantity>${escapeXml(quantity)}</quantity>
+  <stock_status>${escapeXml(stock_status)}</stock_status>
+  <picture>${escapeXml(image || '')}</picture>
+  <vendor>${escapeXml(vendor)}</vendor>
+  <sku>${escapeXml(product.sku || '')}</sku>
+  <label></label>
+  <order>${index + 1}</order>
+  <description>${escapeXml(description)}</description>
+  <short_description>${escapeXml(product.name || '')}</short_description>
+  ${params}
+</offer>`;
+  }).join('\n');
 }
 
-export async function wixStores_onProductUpdated(event) {
-  console.log('E_LEADS_PRODUCT_UPDATED_EVENT:', JSON.stringify(event));
+export async function get_eLeadsFeed() {
+  try {
+    const all_products = await getAllProducts();
+    const all_collections = await getAllCollections();
 
-  const product_id = getEventProductId(event);
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-  if (!product_id) {
-    console.error('E_LEADS_UPDATE_NO_PRODUCT_ID:', JSON.stringify(event));
-    return;
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<yml_catalog date="${now}">
+  <shop>
+    <shopName>${escapeXml(SHOP_NAME)}</shopName>
+    <email>${escapeXml(SHOP_EMAIL)}</email>
+    <url>${escapeXml(SITE_URL)}</url>
+    <language>${escapeXml(LANGUAGE)}</language>
+    <categories>
+${buildCategoriesXml(all_collections)}
+    </categories>
+    <offers>
+${buildOffersXml(all_products, all_collections)}
+    </offers>
+  </shop>
+</yml_catalog>`;
+
+    return response({
+      status: 200,
+      headers: {
+        'Content-Type': 'application/xml; charset=utf-8'
+      },
+      body: xml
+    });
+
+  } catch (error) {
+    return serverError({
+      body: { error: error.message }
+    });
   }
-
-  return syncProduct(product_id, 'update');
-}
-
-export async function wixStores_onProductDeleted(event) {
-  console.log('E_LEADS_PRODUCT_DELETED_EVENT:', JSON.stringify(event));
-
-  const product_id = getEventProductId(event);
-
-  if (!product_id) {
-    console.error('E_LEADS_DELETE_NO_PRODUCT_ID:', JSON.stringify(event));
-    return;
-  }
-
-  return sendToELeads(
-    'DELETE',
-    `${API_BASE_URL}/ecommerce/items/${encodeURIComponent(String(product_id))}`,
-    {
-      language: LANGUAGE
-    }
-  );
 }
